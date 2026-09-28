@@ -120,7 +120,7 @@ function renderAlternatorQ(){
 
 function renderArchitecture(){
   const app = document.getElementById('app');
-  const opts = [["SINGLE","Solteira"],["TANDEM","Tandem"],["SELF_PROPELLED","Autotransportável"],["OTHER","Outra"]];
+  const opts = [["SINGLE","Solteira"],["TANDEM","Tandem"],["SELF_TRANSPORTABLE","Autotransportável"],["OTHER","Outra"]];
   app.innerHTML = stepLabel("Arquitetura da plantadeira") + `<h2>Qual a arquitetura da máquina?</h2>` +
     opts.map(([v,l])=>`<button class="opt ${state.architecture===v?'sel':''}" data-v="${v}">${l}</button>`).join("") +
     `<div class="actions"><button class="ghost" id="bk">Voltar</button><button class="primary" id="nx" ${state.architecture?'':'disabled'}>Continuar</button></div>`;
@@ -185,100 +185,128 @@ function renderSectionRows(){
   };
 }
 
-/* ---------- MOTOR DE REGRAS ---------- */
-/* Estas três funções concentram toda a lógica de negócio e podem ser
-   extraídas para um módulo de backend (Node/Python/etc.) sem alterações,
-   desde que recebam o mesmo formato de `state`. */
+/* ---------- MOTOR DE REGRAS v0.2 ---------- */
+/* Camadas: entrada (state) -> regras -> cálculos -> resultado. Sem preço, estoque ou ERP. */
+
+const ALT_OUTPUTS = 6, MAX_PER_OUTPUT = 10;
+const PANEL_CABLE_OPTIONS_M = [4, 9, 14]; // R014 — regra de escolha PENDENTE
+const LINE_CABLES = [                      // R015 — regra de composição PENDENTE
+  {type:"LINE_CABLE_1", code:"30000000687", name:"KIT CHICOTE 1 LINHA", lines:1},
+  {type:"LINE_CABLE_4", code:"30000000688", name:"KIT CHICOTE 4 LINHA", lines:4},
+];
 
 function computeDistribution(){
-  // R: cada seção começa em uma nova saída; nenhuma saída excede 10 linhas.
-  // Seções não compartilham saída entre si (distribuição física coerente com a arquitetura).
-  let outputIdx = 0;
-  const distribution = []; // {output, section, rows}
-  for(const sec of state.sections){
-    let remaining = sec.rows;
-    while(remaining > 0){
-      outputIdx++;
-      const take = Math.min(10, remaining);
-      distribution.push({output: outputIdx, section: sec.id, rows: take});
-      remaining -= take;
-    }
+  // R012/R013: as 6 saídas são um recurso GLOBAL; seções não reservam saídas.
+  if(!state.hydraulic_alternator) return {applicable:false, distribution:[], capacity:0, capacityExceeded:false};
+  const capacity = ALT_OUTPUTS * MAX_PER_OUTPUT;
+  let remaining = state.total_rows;
+  const distribution = [];
+  for(let o = 1; o <= ALT_OUTPUTS && remaining > 0; o++){
+    const take = Math.min(MAX_PER_OUTPUT, remaining);
+    distribution.push({output:o, rows:take});
+    remaining -= take;
   }
-  const outputsUsed = outputIdx;
-  const capacityExceeded = outputsUsed > 6;
-  return {distribution, outputsUsed, capacityExceeded};
-}
-
-function computeCables(distribution){
-  // Regra ilustrativa (pendente validação técnica R05): fours = floor(n/4), ones = n%4
-  let totalFours = 0, totalOnes = 0;
-  const perOutput = distribution.map(d=>{
-    const fours = Math.floor(d.rows/4);
-    const ones = d.rows % 4;
-    totalFours += fours; totalOnes += ones;
-    return {...d, fours, ones};
-  });
-  return {perOutput, totalFours, totalOnes};
+  return {applicable:true, distribution, capacity, capacityExceeded: state.total_rows > capacity};
 }
 
 function computeComponents(){
-  const comps = [];
-  comps.push({name:"Conjunto ECU", rule:"MANDATORY"});
-  comps.push({name:"Sensor de levante", rule:"MANDATORY"});
-  comps.push({name:"Sensor de semente", rule:"MANDATORY", pending:"Quantidade — R01 pendente"});
-  comps.push({name:"Cabo ISOBUS", rule:"MANDATORY", pending:"Modelo/comprimento — R02 pendente"});
+  const c = [];
+  c.push({name:"Conjunto ECU", quantity:1, rule_id:"R002"});
+  c.push({name:"Sensor de levante", quantity:1, rule_id:"R002"});
+  c.push({name:"Sensor de semente", quantity:state.total_rows, rule_id:"R003"});
+  c.push({name:"Cabo ISOBUS", quantity:1, rule_id:"R002", pending:"modelo/comprimento pendente"});
   if(state.hydraulic_alternator){
-    comps.push({name:"Alternador hidráulico", rule:"CONDITIONAL"});
-    comps.push({name:"Mangueiras hidráulicas", rule:"CONDITIONAL", pending:"Comprimento — R04 pendente"});
+    c.push({name:"Alternador hidráulico", quantity:1, rule_id: state.total_rows>=13 ? "R004" : "R005"});
   } else {
-    comps.push({name:"Cabo de alimentação direto da bateria", rule:"CONDITIONAL", pending:"Modelo — R03 pendente"});
+    c.push({name:"Cabo de alimentação direto da bateria", quantity:1, rule_id:"R006"});
   }
-  return comps;
+  return c;
+}
+
+function buildConfiguration(){
+  const dist = computeDistribution();
+  return {
+    technology: state.technology,
+    total_rows: state.total_rows,
+    hydraulic_alternator: !!state.hydraulic_alternator,
+    battery_power_cable: !state.hydraulic_alternator,
+    machine_architecture: state.architecture,
+    section_count: state.section_count,
+    sections: state.sections.map(s=>({section:s.id, rows:s.rows})),
+    alternator_outputs: state.hydraulic_alternator ? ALT_OUTPUTS : null,
+    max_rows_per_output: state.hydraulic_alternator ? MAX_PER_OUTPUT : null,
+    electrical_distribution: dist.distribution,
+    panel_cable: state.hydraulic_alternator ? {options_m:PANEL_CABLE_OPTIONS_M, selected:null, status:"PENDENTE"} : null,
+    line_cables: state.hydraulic_alternator ? {options:LINE_CABLES, composition:null, status:"PENDENTE"} : null,
+    components: computeComponents().map(({name,quantity,rule_id})=>({name,quantity,rule_id})),
+  };
 }
 
 /* ---------- FIM DO MOTOR DE REGRAS ---------- */
 
 function renderReview(){
   const app = document.getElementById('app');
-  const {distribution, outputsUsed, capacityExceeded} = computeDistribution();
-  const {perOutput, totalFours, totalOnes} = computeCables(distribution);
-  const components = computeComponents();
-  const archLabel = {SINGLE:"Solteira",TANDEM:"Tandem",SELF_PROPELLED:"Autotransportável",OTHER:"Outra"}[state.architecture];
+  const dist = computeDistribution();
+  const comps = computeComponents();
+  const cfg = buildConfiguration();
+  const archLabel = {SINGLE:"Solteira",TANDEM:"Tandem",SELF_TRANSPORTABLE:"Autotransportável",OTHER:"Outra"}[state.architecture];
+  const alt = state.hydraulic_alternator;
 
-  let html = stepLabel("Configuração técnica gerada") + `<h2>Resultado</h2>`;
-
-  if(capacityExceeded){
-    html += `<div class="warn">A distribuição exige ${outputsUsed} saídas, excedendo as 6 disponíveis no alternador. Esta condição não possui regra definida (R07 pendente) — configuração inválida sem definição técnica adicional.</div>`;
+  let h = stepLabel("Configuração técnica gerada") + `<h2>Resultado</h2>`;
+  if(dist.capacityExceeded){
+    h += `<div class="warn">${state.total_rows} linhas excedem a capacidade do alternador (${dist.capacity} linhas). Tratamento desse caso ainda não definido — configuração incompleta.</div>`;
   }
 
-  html += `<div class="summary-block"><h3>Entradas</h3>
+  h += `<div class="summary-block"><h3>Entradas</h3>
     <div class="kv"><span>Tecnologia</span><span>${state.technology.replace('_',' ')}</span></div>
-    <div class="kv"><span>Total de linhas</span><span>${state.total_rows}</span></div>
-    <div class="kv"><span>Alternador hidráulico</span><span>${state.hydraulic_alternator ? "Sim" : "Não"}${state.total_rows>=13?' <span class="tag">R001</span>':''}</span></div>
+    <div class="kv"><span>Número de linhas</span><span>${state.total_rows}</span></div>
+    <div class="kv"><span>Alternador</span><span>${alt ? (state.total_rows>=13?'Obrigatório <span class="tag">R004</span>':'Sim <span class="tag">R005</span>') : 'Não <span class="tag">R005</span>'}</span></div>
     <div class="kv"><span>Arquitetura</span><span>${archLabel}</span></div>
-    <div class="kv"><span>Seções</span><span>${state.sections.map(s=>s.rows).join(' / ')}</span></div>
+    <div class="kv"><span>Seções</span><span>${state.sections.length} — ${state.sections.map(s=>s.rows).join(' / ')}</span></div>
   </div>`;
 
-  html += `<div class="summary-block"><h3>Distribuição elétrica (6 saídas, máx. 10 linhas/saída)</h3>`;
-  html += distribution.map(d=>`<div class="out-group">Saída ${d.output} → Seção ${d.section} — ${d.rows} linha(s)</div>`).join("");
-  html += `<div class="kv"><span>Saídas utilizadas</span><span>${outputsUsed} / 6</span></div></div>`;
+  h += `<div class="summary-block"><h3>Componentes obrigatórios</h3>` +
+    comps.map(c=>`<div class="kv"><span>${c.name}<span class="tag">${c.rule_id}</span></span><span>${c.quantity}${c.pending?` <span class="pending">(${c.pending})</span>`:''}</span></div>`).join("") + `</div>`;
 
-  html += `<div class="summary-block"><h3>Cabos de linha <span class="pending">(composição ilustrativa — R05 pendente)</span></h3>`;
-  html += perOutput.map(d=>`<div class="out-group">Saída ${d.output}: ${d.fours} cabo(s) de 4 linhas${d.ones?` + ${d.ones} cabo(s) de 1 linha`:''}</div>`).join("");
-  html += `<div class="kv"><span>Total cabo 4 linhas</span><span>${totalFours}</span></div>
-    <div class="kv"><span>Total cabo 1 linha</span><span>${totalOnes}</span></div></div>`;
+  if(alt){
+    h += `<div class="summary-block"><h3>Estrutura de alimentação <span class="tag">R007</span><span class="tag">R008</span></h3>
+      <div class="kv"><span>Saídas do alternador</span><span>${ALT_OUTPUTS}</span></div>
+      <div class="kv"><span>Capacidade por saída</span><span>${MAX_PER_OUTPUT} linhas</span></div>
+      <div class="kv"><span>Capacidade total</span><span>${dist.capacity} linhas</span></div>
+      <div class="kv"><span>Linhas da máquina</span><span>${state.total_rows}</span></div>
+      <div style="height:10px"></div>` +
+      dist.distribution.map(d=>`<div class="out-group">Saída ${d.output} → ${d.rows} linha(s)</div>`).join("") +
+      `<div class="pending">Distribuição global (R012/R013): as seções podem compartilhar as saídas.</div></div>`;
 
-  html += `<div class="summary-block"><h3>Componentes obrigatórios</h3>`;
-  html += components.map(c=>`<div class="kv"><span>${c.name}</span><span>${c.pending?`<span class="pending">${c.pending}</span>`:'✓'}</span></div>`).join("");
-  html += `</div>`;
+    h += `<div class="summary-block"><h3>Cadeia física</h3>
+      <div class="out-group">Alternador</div>
+      <div class="out-group">Cabo de painel — opções: ${PANEL_CABLE_OPTIONS_M.join(' m / ')} m <span class="tag">R014</span><br><span class="pending">seleção do comprimento: pendente</span></div>
+      <div class="out-group">Cabos de linha <span class="tag">R015</span><br>` +
+        LINE_CABLES.map(l=>`${l.name} (${l.code})`).join("<br>") +
+        `<br><span class="pending">composição 1 linha / 4 linhas: pendente de validação</span></div>
+      <div class="out-group">Linhas da plantadeira</div></div>`;
+  }
 
-  html += `<div class="summary-block"><h3>Próximas etapas (fora do MVP)</h3>
-    <div class="pending">Marca, modelo e adaptação entram na sequência seguinte, para determinar a instalação. Regras pendentes: R01–R13 (ver especificação).</div></div>`;
+  h += `<div class="summary-block"><h3>Estrutura da máquina (armazenada)</h3>
+    <div class="pending">Arquitetura e seções são registradas para regras futuras de cabos de alimentação. Não limitam as saídas do alternador.</div></div>`;
 
-  html += `<div class="final-actions"><button class="ghost" id="bk">Voltar</button><button class="ghost" id="restart">Nova configuração</button></div>`;
+  h += `<div class="summary-block"><h3>Configuração estruturada (JSON)</h3>
+    <pre id="json" style="margin:0 0 10px;font-size:.72rem;overflow-x:auto;white-space:pre-wrap;word-break:break-word">${JSON.stringify(cfg,null,2)}</pre>
+    <button class="ghost" id="copy">Copiar JSON</button></div>`;
 
-  app.innerHTML = html;
-  document.getElementById('bk').onclick = back;
+  h += `<div class="summary-block"><h3>Pendências (não implementadas)</h3>
+    <div class="pending">Comprimento do ISOBUS e do cabo de painel · mangueiras · cabo de alimentação do equipamento · composição de cabos 1/4 linhas · distribuição física por seção · marca/modelo/adaptação · comercial.</div></div>`;
+
+  h += `<div class="final-actions"><button class="ghost" id="bk">Voltar</button><button class="ghost" id="restart">Nova configuração</button></div>`;
+  app.innerHTML = h;
+
+  document.getElementById('copy').onclick = ()=>{
+    const t = JSON.stringify(cfg,null,2);
+    (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(
+      ()=>{document.getElementById('copy').textContent='Copiado ✓';},
+      ()=>{const r=document.createRange();r.selectNode(document.getElementById('json'));getSelection().removeAllRanges();getSelection().addRange(r);});
+  };
+  document.getElementById('bk').onclick = ()=> state.architecture==="SINGLE" ? goto("architecture") : back();
   document.getElementById('restart').onclick = ()=>{
     state = {step:0, technology:null, total_rows:null, hydraulic_alternator:null, architecture:null, section_count:null, sections:[]};
     render();
